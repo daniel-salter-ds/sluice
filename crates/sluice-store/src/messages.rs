@@ -568,21 +568,24 @@ pub fn post(
     if to == from {
         return Err(invalid(format!("{from} cannot address itself")));
     }
-    // A settled or submitted step has nobody left to read a message: refuse it rather
-    // than keep it.
-    // Closing a question it asked is still allowed; that reaches nobody.
-    let closing = matches!(&verb, Verb::Reply { answer: Some(a), .. } if a.action == "close");
-    if !closing && let Some(why) = closed(tx.sql(), project, &to)? {
-        return Err(conflict(format!(
-            "step {to} {why}, so it takes no more messages; to send it work, retry it with step_retry and a message"
-        )));
-    }
     let resolving = parent
         .as_ref()
         .filter(|p| p.is_question())
         .map(|p| question(tx.sql(), project, p.id))
         .transpose()?
         .filter(|q| q.state == QuestionState::Open);
+    // A settled or submitted step has nobody left to read a message: refuse it rather
+    // than keep it.
+    // Answering or closing a question it asked is still taken: a question that does not
+    // wait leaves its step settled at once, and its answer is for the plan input it sets,
+    // whoever reads the inbox, or the step's retry to take up.
+    if resolving.is_none()
+        && let Some(why) = closed(tx.sql(), project, &to)?
+    {
+        return Err(conflict(format!(
+            "step {to} {why}, so it takes no more messages; to send it work, retry it with step_retry and a message"
+        )));
+    }
     let answer = match &verb {
         Verb::Reply { answer, .. } => answer.clone(),
         _ => None,

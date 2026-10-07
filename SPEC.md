@@ -812,9 +812,10 @@ tool` do not take).
 - A step whose status is `succeeded`, `failed`, `stale` or `skipped`, or running with every
   run it has already submitted (its agents' sessions are over; the runs are only finishing),
   takes no messages: an `ask` or `say` to it, and a reply whose `to` it is (to a question it
-  asked earlier, say), are refused (`conflict`, saying why) and nothing is stored or
-  queued. A reply that closes such a question (`answer.action == "close"`) is still taken. A
-  retry's message reaches the step after the retry has reopened it.
+  asked that is already answered, say), are refused (`conflict`, saying why) and nothing is
+  stored or queued. A reply that answers or closes such a question while it is open is still
+  taken: the question is answered (setting its `input`) or closed, and the step's retry takes
+  it up. A retry's message reaches the step after the retry has reopened it.
 - The thread: a reply keeps the original's; a message from a step's run lives on its own
   step's thread `step-<step>`; one to a step on `step-<step>`; between the orchestrator and the
   owner on the fixed thread `owner`.

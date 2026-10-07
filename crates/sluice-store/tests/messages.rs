@@ -1309,10 +1309,18 @@ async fn receipts_follow_the_recipient_and_its_step_runs() {
         .await;
     let r = receipt("work").await.unwrap().receipt;
     assert_eq!((r.delivery, r.run), (Delivery::NoLiveRun, None));
-    // Settled: refused and not stored, and so is a reply to the question it asked
-    // before it settled; closing that question still works.
+    // Settled: refused and not stored. An answer to a question it asked before it
+    // settled is still taken, and so is closing one; a later reply to it is refused.
     let q = f
         .post(asking(p, "q").to("orchestrator").speaker(Speaker::Run(run)))
+        .await
+        .unwrap();
+    let other = f
+        .post(
+            asking(p, "other")
+                .to("orchestrator")
+                .speaker(Speaker::Run(run)),
+        )
         .await
         .unwrap();
     for status in ["succeeded", "failed", "stale", "skipped"] {
@@ -1331,8 +1339,6 @@ async fn receipts_follow_the_recipient_and_its_step_runs() {
         for refused in [
             f.posted(draft(p, "hi").to("work")).await,
             f.posted(asking(p, "why").to("work")).await,
-            f.posted(reply(p, q.id, "answer").speaker(Speaker::Orchestrator))
-                .await,
         ] {
             assert!(
                 matches!(&refused, Err(PublicError::Conflict { message, .. }) if message.contains("step work is settled")),
@@ -1341,9 +1347,27 @@ async fn receipts_follow_the_recipient_and_its_step_runs() {
         }
         assert_eq!(f.count("messages").await, before, "{status}");
     }
+    let answered = f
+        .posted(reply(p, q.id, "answer").speaker(Speaker::Orchestrator))
+        .await
+        .unwrap();
+    assert_eq!(
+        (answered.receipt.to.as_str(), answered.receipt.delivery),
+        ("work", Delivery::NoLiveRun)
+    );
+    assert_eq!(f.question(q.id).await.state, QuestionState::Answered);
+    let before = f.count("messages").await;
+    let refused = f
+        .posted(reply(p, q.id, "again").speaker(Speaker::Orchestrator))
+        .await;
+    assert!(
+        matches!(&refused, Err(PublicError::Conflict { message, .. }) if message.contains("step work is settled")),
+        "{refused:?}"
+    );
+    assert_eq!(f.count("messages").await, before);
     let closed = f
         .posted(
-            reply(p, q.id, "")
+            reply(p, other.id, "")
                 .answer(MessageAnswer {
                     action: "close".into(),
                     params: None,
@@ -1354,6 +1378,7 @@ async fn receipts_follow_the_recipient_and_its_step_runs() {
         .await
         .unwrap();
     assert_eq!(closed.receipt.to, "work");
+    assert_eq!(f.question(other.id).await.state, QuestionState::Closed);
     // A reply to a removed step's message is kept, with nobody to run it.
     set("DELETE FROM steps WHERE project_id=?1 AND step_id='work'").await;
     let r = f
