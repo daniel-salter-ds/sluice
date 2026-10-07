@@ -1364,11 +1364,12 @@ run(main)
     assert!(checked > 3, "scanned {checked} files");
 }
 /// Steps blocked on waiting asks hold nothing other requests need: with more of them
-/// than the coordinator has read connections, it keeps answering while they wait.
+/// than the coordinator has read connections, it keeps answering while they wait, and a
+/// restart leaves them waiting rather than failed.
 #[test]
-fn waiting_asks_do_not_wedge_the_coordinator() {
+fn waiting_asks_neither_wedge_the_coordinator_nor_fail_on_its_restart() {
     const ASKS: usize = 8;
-    let g = Gate::new();
+    let mut g = Gate::new();
     let steps = (0..ASKS)
         .map(|i| {
             let ask =
@@ -1380,7 +1381,7 @@ fn waiting_asks_do_not_wedge_the_coordinator() {
         })
         .collect::<serde_json::Map<_, _>>();
     g.plan(Value::Object(steps));
-    let _lease = g.lease();
+    let lease = g.lease();
     let open = |g: &Gate| {
         let CommandReply::Messages(page) = g.rpc(json!({"command":"messages","args":{"project":g.selector(),"view":"questions","thread":null,"since":null,"owner":true}})) else {
             panic!("messages")
@@ -1403,6 +1404,26 @@ fn waiting_asks_do_not_wedge_the_coordinator() {
         }
     };
     answers_promptly(&g);
+    // Restart it as systemd does, with SIGTERM.
+    drop(lease);
+    let mut broker = g.broker.take().unwrap();
+    let pid = broker.id().to_string();
+    assert!(
+        Command::new("/bin/kill")
+            .args(["-TERM", &pid])
+            .status()
+            .unwrap()
+            .success()
+    );
+    broker.wait().unwrap();
+    g.boot();
+    let _lease = g.lease();
+    answers_promptly(&g);
+    assert_eq!(open(&g).len(), ASKS);
+    for i in 0..ASKS {
+        let step = &g.status()["steps"][format!("ask{i}")];
+        assert_eq!(step["status"], "running", "{step}");
+    }
     for q in open(&g) {
         g.rpc(json!({"command":"reply","args":{"project":g.selector(),"to_message":q.id,"body":"","answer":{"action":"approve","params":null,"values":null},"owner":true}}));
     }

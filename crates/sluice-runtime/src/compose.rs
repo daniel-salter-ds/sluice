@@ -163,9 +163,16 @@ impl Dispatcher {
                 .invoke(request)
                 .await;
         }
-        let mut stream = UnixStream::connect(self.home.join("coordinator.sock"))
-            .await
-            .map_err(failure)?;
+        self.forward(&request).await.map_err(failure)?
+    }
+    /// A helper request sent on to the coordinator: the outer error is the exchange
+    /// failing (no coordinator, or one that went away without answering), the inner
+    /// result its answer.
+    async fn forward(
+        &self,
+        request: &HelperRequest,
+    ) -> std::io::Result<Result<CommandReply, PublicError>> {
+        let mut stream = UnixStream::connect(self.home.join("coordinator.sock")).await?;
         socket::write_frame(
             &mut stream,
             &socket::Request {
@@ -180,16 +187,15 @@ impl Dispatcher {
                 },
             },
         )
-        .await
-        .map_err(failure)?;
-        let reply: RpcReply = socket::read_frame(&mut stream).await.map_err(failure)?;
+        .await?;
+        let reply: RpcReply = socket::read_frame(&mut stream).await?;
         if reply.request_id != request.request_id || reply.protocol != PROTOCOL_VERSION {
-            return Err(failure("helper reply identity mismatch"));
+            return Ok(Err(failure("helper reply identity mismatch")));
         }
-        match reply.result {
+        Ok(match reply.result {
             RpcResult::Ok(reply) => Ok(*reply),
             RpcResult::Error(e) => Err(e),
-        }
+        })
     }
     async fn python(&self, invocation: &FnInvocation) -> Result<JsonMap, PublicError> {
         let run_dir = self.home.join("runs").join(invocation.run.to_string());
@@ -329,6 +335,8 @@ fn builtin_failure(error: crate::builtins::FnFailure) -> PublicError {
         error => failure(error),
     }
 }
+/// How long a waiting message builtin keeps asking a coordinator that is away.
+const RESUME_FOR: std::time::Duration = std::time::Duration::from_secs(600);
 async fn builtin_once(
     dispatcher: &Dispatcher,
     invocation: FnInvocation,
@@ -368,21 +376,45 @@ async fn builtin_once(
         });
     }
     if name.starts_with("message.") {
-        return dispatcher
-            .callback(HelperRequest {
-                protocol: 1,
-                request_id: RequestId(InvocationId::new().to_string()),
-                run_capability: Some(dispatcher.launch.capability.clone()),
-                command: HelperCommand::Extension(HelperExtension::Tool(ToolRequest {
-                    name: name.into(),
-                    args: invocation.inputs,
-                })),
-            })
-            .await
-            .and_then(|r| match r {
-                CommandReply::Data(v) => decode_json(&serde_json::to_vec(&v).map_err(failure)?),
-                _ => Err(failure("message builtin reply")),
-            });
+        // A waiting ask asked again takes up its own question, and message.wait only
+        // reads, so one the coordinator dropped (a restart) is asked again once it is
+        // back instead of failing the step.
+        let resumable = name == "message.wait"
+            || (name == "message.ask"
+                && invocation.inputs.0.get("wait").map(JsonValue::as_value)
+                    == Some(&serde_json::Value::Bool(true)));
+        let request = HelperRequest {
+            protocol: 1,
+            request_id: RequestId(InvocationId::new().to_string()),
+            run_capability: Some(dispatcher.launch.capability.clone()),
+            command: HelperCommand::Extension(HelperExtension::Tool(ToolRequest {
+                name: name.into(),
+                args: invocation.inputs,
+            })),
+        };
+        let until = tokio::time::Instant::now() + RESUME_FOR;
+        let reply = loop {
+            let answer = dispatcher.forward(&request).await;
+            let dropped = matches!(
+                answer,
+                Err(_)
+                    | Ok(Err(PublicError::Busy {
+                        retryable: true,
+                        ..
+                    }))
+            );
+            if !resumable || !dropped || tokio::time::Instant::now() >= until {
+                break answer.map_err(failure)?;
+            }
+            tokio::select! {
+                _ = dispatcher.cancel.cancelled() => return Err(PublicError::Cancelled { message: "message builtin cancelled while the coordinator was away".into() }),
+                _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {},
+            }
+        };
+        return reply.and_then(|r| match r {
+            CommandReply::Data(v) => decode_json(&serde_json::to_vec(&v).map_err(failure)?),
+            _ => Err(failure("message builtin reply")),
+        });
     }
     crate::builtins::dispatch(name, &invocation.inputs, &context)
         .await
