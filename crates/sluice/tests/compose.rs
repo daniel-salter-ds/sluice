@@ -1363,6 +1363,58 @@ run(main)
     }
     assert!(checked > 3, "scanned {checked} files");
 }
+/// Steps blocked on waiting asks hold nothing other requests need: with more of them
+/// than the coordinator has read connections, it keeps answering while they wait.
+#[test]
+fn waiting_asks_do_not_wedge_the_coordinator() {
+    const ASKS: usize = 8;
+    let g = Gate::new();
+    let steps = (0..ASKS)
+        .map(|i| {
+            let ask =
+                json!({"to":"owner","title":format!("Merge {i}?"),"body":"Approve?","wait":true});
+            (
+                format!("ask{i}"),
+                json!({"run":"message.ask","in":bindings(ask)}),
+            )
+        })
+        .collect::<serde_json::Map<_, _>>();
+    g.plan(Value::Object(steps));
+    let _lease = g.lease();
+    let open = |g: &Gate| {
+        let CommandReply::Messages(page) = g.rpc(json!({"command":"messages","args":{"project":g.selector(),"view":"questions","thread":null,"since":null,"owner":true}})) else {
+            panic!("messages")
+        };
+        page.messages
+    };
+    g.wait(|g| open(g).len() == ASKS);
+    let answers_promptly = |g: &Gate| {
+        let until = Instant::now() + Duration::from_secs(20);
+        while Instant::now() < until {
+            let started = Instant::now();
+            g.status();
+            g.rpc(json!({"command":"say","args":{"project":g.selector(),"body":"still here","to":"owner"}}));
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "the coordinator took {:?} to answer",
+                started.elapsed()
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    };
+    answers_promptly(&g);
+    for q in open(&g) {
+        g.rpc(json!({"command":"reply","args":{"project":g.selector(),"to_message":q.id,"body":"","answer":{"action":"approve","params":null,"values":null},"owner":true}}));
+    }
+    for i in 0..ASKS {
+        let step = g.terminal(&format!("ask{i}"));
+        assert_eq!(step["status"], "succeeded", "{step}");
+        assert_eq!(
+            step["outputs"]["reply"]["answer"]["action"], "approve",
+            "{step}"
+        );
+    }
+}
 #[test]
 fn owner_question_runs_the_configured_notify_command_once() {
     let g = Gate::configured(|g| {

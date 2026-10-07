@@ -1330,21 +1330,33 @@ impl<H: ExecutionHost> Coordinator<H> {
                         .map_err(|e| e.into_public(true))?;
                     let operation =
                         crate::builtins::messages::dispatch(&tool.name, &tool.args, &ctx);
-                    tokio::pin!(operation);
-                    loop {
-                        if matches!(
-                            self.guardian(CoordinatorCommand::CancelIntent(id.clone()), capability)
+                    // The operation is polled alongside the cancel check, never left parked
+                    // while the check awaits a read: a parked operation keeps the read pool
+                    // permit it has been granted, and with as many waiting asks as the pool
+                    // has connections every read in the coordinator waited forever.
+                    let cancelled = async {
+                        loop {
+                            if matches!(
+                                self.guardian(
+                                    CoordinatorCommand::CancelIntent(id.clone()),
+                                    capability
+                                )
                                 .await?,
-                            CoordinatorReply::CancelIntent(true)
-                        ) {
+                                CoordinatorReply::CancelIntent(true)
+                            ) {
+                                return Ok::<_, PublicError>(());
+                            }
+                            changes.wait().await.map_err(|e| e.into_public(true))?;
+                        }
+                    };
+                    tokio::select! {
+                        result = operation => return result.map_err(storage).and_then(data),
+                        cancelled = cancelled => {
+                            cancelled?;
                             ctx.cancel.cancel();
                             return Err(PublicError::Cancelled {
                                 message: "message wait cancelled".into(),
                             });
-                        }
-                        tokio::select! {
-                            result = &mut operation => return result.map_err(storage).and_then(data),
-                            changed = changes.wait() => { changed.map_err(|e| e.into_public(true))?; }
                         }
                     }
                 }
